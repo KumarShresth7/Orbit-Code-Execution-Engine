@@ -5,10 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
-	"strings" // Added for string comparison
+	"strings"
 	"time"
 
 	"github.com/docker/docker/api/types"
@@ -26,30 +27,31 @@ import (
 type Job struct {
 	ID             string `json:"id"`
 	Code           string `json:"code"`
-	ExpectedOutput string `json:"expected_output"` // User Input
-	ActualOutput   string `json:"actual_output"`   // System Output
-	Verdict        string `json:"verdict"`         // "Passed", "Failed", "Error"
+	ExpectedOutput string `json:"expected_output"`
+	ActualOutput   string `json:"actual_output"`
+	Verdict        string `json:"verdict"`     // Passed, Failed, Error
+	AiDiagnosis    string `json:"ai_diagnosis"` // <--- New Field for AI Feedback
 	Status         string `json:"status"`
 	CreatedAt      int64  `json:"created_at"`
 }
 
-// Metrics
+// Prometheus Metrics
 var jobsProcessed = prometheus.NewCounter(
 	prometheus.CounterOpts{
 		Name: "orbit_jobs_processed_total",
 		Help: "Total number of jobs processed",
 	},
 )
-var activeWorkers = prometheus.NewGauge(
-	prometheus.GaugeOpts{
-		Name: "orbit_active_workers",
-		Help: "Number of workers currently executing a task",
+var aiCalls = prometheus.NewCounter(
+	prometheus.CounterOpts{
+		Name: "orbit_ai_calls_total",
+		Help: "Total number of times Nexus AI was triggered",
 	},
 )
 
 func init() {
 	prometheus.MustRegister(jobsProcessed)
-	prometheus.MustRegister(activeWorkers)
+	prometheus.MustRegister(aiCalls)
 }
 
 var ctx = context.Background()
@@ -116,11 +118,11 @@ func main() {
 		c.JSON(http.StatusOK, job)
 	})
 
-	fmt.Println("🚀 Orbit Judge Server running on http://localhost:8080")
+	fmt.Println("🚀 Orbit Server + Nexus AI running on http://localhost:8080")
 	r.Run(":8080")
 }
 
-// --- 5. Worker (The Judge Logic) ---
+// --- 5. Worker Logic ---
 func startWorker(workerID int) {
 	fmt.Printf("👷 Worker %d ready.\n", workerID)
 	for {
@@ -130,27 +132,36 @@ func startWorker(workerID int) {
 		}
 
 		jobID := result[1]
-		activeWorkers.Inc()
-
 		val, _ := rdb.Get(ctx, "job:"+jobID).Result()
 		var job Job
 		json.Unmarshal([]byte(val), &job)
+
 		job.Status = "processing"
 		updateJob(job)
 
-		// A. Execute Code
 		output, err := executePythonCode(job.Code)
+		job.ActualOutput = output
 
-		// B. Judge the Result
+		// LOGIC UPDATE: Check for Python Errors (Stderr)
+		isRuntimeError := false
 		if err != nil {
-			job.Status = "failed"
-			job.Verdict = "Error"
+			isRuntimeError = true // Docker failure
 			job.ActualOutput = err.Error()
+		} else if strings.Contains(output, "Traceback (most recent call last)") || strings.Contains(output, "Error:") {
+			isRuntimeError = true // Python code crash
+		}
+
+		if isRuntimeError {
+			job.Status = "failed"
+			job.Verdict = "Runtime Error"
+			
+			// 🚀 CALL AI DIAGNOSIS
+			fmt.Printf("🤖 [Worker %d] Runtime Error detected. Calling Nexus...\n", workerID)
+			job.AiDiagnosis = callNexusAI(job.Code, job.ActualOutput)
+			aiCalls.Inc()
 		} else {
 			job.Status = "completed"
-			job.ActualOutput = output
-
-			// The Comparison Logic (Trim whitespace to be safe)
+			// Logic check
 			if strings.TrimSpace(job.ActualOutput) == strings.TrimSpace(job.ExpectedOutput) {
 				job.Verdict = "Passed"
 			} else {
@@ -159,19 +170,39 @@ func startWorker(workerID int) {
 		}
 
 		updateJob(job)
-		activeWorkers.Dec()
 		jobsProcessed.Inc()
-
 		fmt.Printf("✅ [Worker %d] Job %s -> Verdict: %s\n", workerID, jobID, job.Verdict)
 	}
 }
-
 func updateJob(job Job) {
 	data, _ := json.Marshal(job)
 	rdb.Set(ctx, "job:"+job.ID, data, 1*time.Hour)
 }
 
-// --- 6. Docker Engine ---
+// --- 6. Nexus AI Integration ---
+func callNexusAI(code, errorMsg string) string {
+	// Prepare JSON payload
+	requestBody, _ := json.Marshal(map[string]string{
+		"code":  code,
+		"error": errorMsg,
+	})
+
+	// Call Python Service (Assuming running on localhost:5000)
+	resp, err := http.Post("http://0.0.0.0:5001/analyze", "application/json", bytes.NewBuffer(requestBody))
+	if err != nil {
+		return "⚠️ Nexus AI Unavailable: " + err.Error()
+	}
+	defer resp.Body.Close()
+
+	// Read Response
+	body, _ := io.ReadAll(resp.Body)
+	var result map[string]string
+	json.Unmarshal(body, &result)
+	
+	return result["analysis"]
+}
+
+// --- 7. Docker Engine ---
 func executePythonCode(pythonCode string) (string, error) {
 	ctx := context.Background()
 	cwd, _ := os.Getwd()
@@ -188,9 +219,10 @@ func executePythonCode(pythonCode string) (string, error) {
 		return "", fmt.Errorf("client error: %v", err)
 	}
 
+	// Create Container
 	resp, err := cli.ContainerCreate(ctx, &container.Config{
 		Image:           "python:alpine",
-		Cmd:             []string{"python", "/app/" + fileName},
+		Cmd:             []string{"python", "-u", "/app/" + fileName}, // Added "-u" for unbuffered output
 		NetworkDisabled: true,
 	}, &container.HostConfig{
 		Mounts: []mount.Mount{
@@ -206,21 +238,33 @@ func executePythonCode(pythonCode string) (string, error) {
 		return "", fmt.Errorf("start error: %v", err)
 	}
 
+	// Wait for container to finish
 	statusCh, errCh := cli.ContainerWait(ctx, resp.ID, container.WaitConditionNotRunning)
-	var outputString string
+	var timeoutWarning string
 	select {
 	case <-statusCh:
 	case <-errCh:
 	case <-time.After(5 * time.Second):
 		cli.ContainerKill(ctx, resp.ID, "SIGKILL")
-		outputString = "⚠️ Time Limit Exceeded"
+		timeoutWarning = "\n⚠️ Time Limit Exceeded"
 	}
 
+	// Fetch Logs (Both Stdout and Stderr)
 	out, _ := cli.ContainerLogs(ctx, resp.ID, types.ContainerLogsOptions{ShowStdout: true, ShowStderr: true})
 	stdOutBuf := new(bytes.Buffer)
-	stdcopy.StdCopy(stdOutBuf, new(bytes.Buffer), out)
+	stdErrBuf := new(bytes.Buffer) // Create a real buffer for Stderr
 	
-	finalOutput := stdOutBuf.String() + outputString
+	// Copy logs to respective buffers
+	stdcopy.StdCopy(stdOutBuf, stdErrBuf, out)
+
+	// Combine Output: Stdout + Stderr + Warnings
+	finalOutput := stdOutBuf.String()
+	if stdErrBuf.Len() > 0 {
+		finalOutput += "\n" + stdErrBuf.String() // Append error log
+	}
+	finalOutput += timeoutWarning
+	
+	// Clean up
 	cli.ContainerRemove(ctx, resp.ID, types.ContainerRemoveOptions{})
 
 	return finalOutput, nil

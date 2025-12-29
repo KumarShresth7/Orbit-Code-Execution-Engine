@@ -7,6 +7,8 @@ services:
     container_name: orbit-redis
     ports:
       - "6379:6379"
+    networks:
+      - orbit-net
 
   # 2. Prometheus (Collector)
   prometheus:
@@ -17,7 +19,9 @@ services:
     ports:
       - "9090:9090"
     extra_hosts:
-      - "host.docker.internal:host-gateway" # Allows access to localhost
+      - "host.docker.internal:host-gateway"
+    networks:
+      - orbit-net
 
   # 3. Grafana (Dashboard)
   grafana:
@@ -27,3 +31,20 @@ services:
       - "3000:3000"
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=admin
+    networks:
+      - orbit-net
+
+  # 4. Nexus AI (The New Brain)
+  nexus:
+    build: ./nexus
+    container_name: orbit-nexus
+    ports:
+      - "5001:5001" # Maps container port 5001 to localhost:5001
+    env_file:
+      - ./nexus/.env # Loads GOOGLE_API_KEY automatically
+    networks:
+      - orbit-net
+
+networks:
+  orbit-net:
+    driver: bridge
