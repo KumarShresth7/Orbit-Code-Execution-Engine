@@ -10,33 +10,37 @@
 
 ---
 
+
 ## 🏗️ System Architecture
 
 The system follows a producer-consumer microservices architecture orchestrated via Docker Compose.
 
 ```mermaid
-graph TD
-    Client[Client / Tests] -->|POST /submit| API[Go API Server]
-    API -->|Push Job| Redis[(Redis Queue)]
+graph LR
+    Client["Client / Tests"] -->|POST /submit| API["Go API Server"]
+    Client -.->|GET /status| API
     
-    subgraph "Worker Pool (Go)"
-        Worker1[Worker 1]
-        Worker2[Worker 2]
-        WorkerN[Worker N]
+    API -->|Push Job| Redis[("Redis Queue")]
+    
+    subgraph "Worker Pool"
+        direction TB
+        Worker1["Worker 1"]
+        Worker2["Worker 2"]
     end
     
     Redis -->|Pop Job| Worker1
     Redis -->|Pop Job| Worker2
     
     subgraph "Execution Layer"
-        Sandbox[Docker Container (Python:Alpine)]
+        Sandbox["Docker Container<br>(Python:Alpine)"]
     end
     
     Worker1 -->|Execute| Sandbox
     
     subgraph "Nexus AI Service"
-        Nexus[FastAPI + LangChain]
-        Gemini[Google Gemini API]
+        direction TB
+        Nexus["FastAPI + LangChain"]
+        Gemini["Google Gemini API"]
     end
     
     Sandbox -->|Runtime Error?| Nexus
@@ -45,9 +49,12 @@ graph TD
     Nexus -->|Diagnosis| Worker1
     
     Worker1 -->|Update Result| Redis
-    Client -->|GET /status| API
     
     subgraph "Observability"
-        Prometheus[Prometheus] -->|Scrape Metrics| API
-        Grafana[Grafana] -->|Visualize| Prometheus
+        direction TB
+        Prometheus["Prometheus"] -->|Scrape Metrics| API
+        Grafana["Grafana"] -->|Visualize| Prometheus
     end
+
+
+
