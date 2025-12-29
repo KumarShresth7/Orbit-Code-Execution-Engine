@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http" // Used for status codes (http.StatusOK)
 	"os"
 	"path/filepath"
 	"time"
@@ -34,16 +35,20 @@ func main() {
 	// --- 2. Connect to Redis ---
 	fmt.Println("🔌 Connecting to Redis...")
 	rdb = redis.NewClient(&redis.Options{
-		Addr: "localhost:6379", // Make sure your Docker Redis is running here
+		Addr: "localhost:6379",
 	})
 	if _, err := rdb.Ping(ctx).Result(); err != nil {
 		panic("❌ Cannot connect to Redis. Is it running? Error: " + err.Error())
 	}
 	fmt.Println("✅ Connected to Redis")
 
-	// --- 3. Start Background Worker ---
-	// This runs in a separate thread (Goroutine) forever
-	go startWorker()
+	// --- 3. Start Worker Pool (Concurrency = 5) ---
+	// This spins up 5 parallel workers to handle jobs
+	concurrency := 5
+	fmt.Printf("👷 Starting %d Workers...\n", concurrency)
+	for i := 1; i <= concurrency; i++ {
+		go startWorker(i)
+	}
 
 	// --- 4. Start API Server ---
 	r := gin.Default()
@@ -54,7 +59,7 @@ func main() {
 			Code string `json:"code"`
 		}
 		if err := c.ShouldBindJSON(&req); err != nil {
-			c.JSON(400, gin.H{"error": "Invalid JSON"})
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid JSON"})
 			return
 		}
 
@@ -71,7 +76,7 @@ func main() {
 		rdb.Set(ctx, "job:"+jobID, jobJSON, 1*time.Hour) // Save Data
 		rdb.LPush(ctx, "job_queue", jobID)             // Push to Queue
 
-		c.JSON(202, gin.H{"job_id": jobID, "message": "Job queued", "status_url": "/status/" + jobID})
+		c.JSON(http.StatusAccepted, gin.H{"job_id": jobID, "message": "Job queued", "status_url": "/status/" + jobID})
 	})
 
 	// Endpoint: Check Status
@@ -79,16 +84,16 @@ func main() {
 		jobID := c.Param("id")
 		val, err := rdb.Get(ctx, "job:"+jobID).Result()
 		if err == redis.Nil {
-			c.JSON(404, gin.H{"error": "Job not found"})
+			c.JSON(http.StatusNotFound, gin.H{"error": "Job not found"})
 			return
 		} else if err != nil {
-			c.JSON(500, gin.H{"error": err.Error()})
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
 		}
 
 		var job Job
 		json.Unmarshal([]byte(val), &job)
-		c.JSON(200, job)
+		c.JSON(http.StatusOK, job)
 	})
 
 	fmt.Println("🚀 Async Server running on http://localhost:8080")
@@ -96,8 +101,8 @@ func main() {
 }
 
 // --- 5. The Worker Logic ---
-func startWorker() {
-	fmt.Println("👷 Worker started. Waiting for jobs...")
+func startWorker(workerID int) {
+	fmt.Printf("👷 Worker %d ready.\n", workerID)
 	for {
 		// Wait for a job (Blocking Pop)
 		result, err := rdb.BLPop(ctx, 0*time.Second, "job_queue").Result()
@@ -106,7 +111,7 @@ func startWorker() {
 		}
 
 		jobID := result[1]
-		fmt.Printf("⚡ Processing Job: %s\n", jobID)
+		fmt.Printf("⚡ [Worker %d] Processing Job: %s\n", workerID, jobID)
 
 		// Fetch Job
 		val, _ := rdb.Get(ctx, "job:"+jobID).Result()
@@ -129,7 +134,7 @@ func startWorker() {
 			job.Output = output
 		}
 		updateJob(job)
-		fmt.Printf("✅ Job %s Finished\n", jobID)
+		fmt.Printf("✅ [Worker %d] Job %s Finished\n", workerID, jobID)
 	}
 }
 
@@ -138,7 +143,7 @@ func updateJob(job Job) {
 	rdb.Set(ctx, "job:"+job.ID, data, 1*time.Hour)
 }
 
-// --- 6. The Docker Engine (Reused & Fixed) ---
+// --- 6. The Docker Engine ---
 func executePythonCode(pythonCode string) (string, error) {
 	ctx := context.Background()
 
@@ -216,7 +221,7 @@ func executePythonCode(pythonCode string) (string, error) {
 		finalOutput += "\n" + outputString
 	}
     
-    // G. Clean up the container immediately to save resources
+    // G. Cleanup
     cli.ContainerRemove(ctx, resp.ID, types.ContainerRemoveOptions{})
 
 	return finalOutput, nil
