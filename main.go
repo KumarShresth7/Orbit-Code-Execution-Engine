@@ -3,8 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
-	"net/http"
 	"os"
 	"path/filepath"
 	"time"
@@ -15,44 +15,130 @@ import (
 	"github.com/docker/docker/client"
 	"github.com/docker/docker/pkg/stdcopy"
 	"github.com/gin-gonic/gin"
+	"github.com/redis/go-redis/v9"
 )
 
-// Define the JSON payload we expect from the user
-type ExecutionRequest struct {
-	Code string `json:"code"`
+// --- 1. Data Structures ---
+type Job struct {
+	ID        string `json:"id"`
+	Code      string `json:"code"`
+	Status    string `json:"status"` // pending, processing, completed, failed
+	Output    string `json:"output"`
+	CreatedAt int64  `json:"created_at"`
 }
 
+var ctx = context.Background()
+var rdb *redis.Client
+
 func main() {
-	// 1. Initialize Gin Router
+	// --- 2. Connect to Redis ---
+	fmt.Println("🔌 Connecting to Redis...")
+	rdb = redis.NewClient(&redis.Options{
+		Addr: "localhost:6379", // Make sure your Docker Redis is running here
+	})
+	if _, err := rdb.Ping(ctx).Result(); err != nil {
+		panic("❌ Cannot connect to Redis. Is it running? Error: " + err.Error())
+	}
+	fmt.Println("✅ Connected to Redis")
+
+	// --- 3. Start Background Worker ---
+	// This runs in a separate thread (Goroutine) forever
+	go startWorker()
+
+	// --- 4. Start API Server ---
 	r := gin.Default()
 
-	// 2. Define the POST endpoint
-	r.POST("/execute", func(c *gin.Context) {
-		var req ExecutionRequest
-
-		// Parse JSON body
+	// Endpoint: Submit Job
+	r.POST("/submit", func(c *gin.Context) {
+		var req struct {
+			Code string `json:"code"`
+		}
 		if err := c.ShouldBindJSON(&req); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid JSON"})
+			c.JSON(400, gin.H{"error": "Invalid JSON"})
 			return
 		}
 
-		// Call our Docker logic
-		output, err := executePythonCode(req.Code)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-			return
+		// Generate ID & Save to Redis
+		jobID := fmt.Sprintf("%d", time.Now().UnixNano())
+		job := Job{
+			ID:        jobID,
+			Code:      req.Code,
+			Status:    "pending",
+			CreatedAt: time.Now().Unix(),
 		}
 
-		// Return output
-		c.JSON(http.StatusOK, gin.H{"output": output})
+		jobJSON, _ := json.Marshal(job)
+		rdb.Set(ctx, "job:"+jobID, jobJSON, 1*time.Hour) // Save Data
+		rdb.LPush(ctx, "job_queue", jobID)             // Push to Queue
+
+		c.JSON(202, gin.H{"job_id": jobID, "message": "Job queued", "status_url": "/status/" + jobID})
 	})
 
-	// 3. Start Server on Port 8080
-	fmt.Println("🚀 Server running on http://localhost:8080")
+	// Endpoint: Check Status
+	r.GET("/status/:id", func(c *gin.Context) {
+		jobID := c.Param("id")
+		val, err := rdb.Get(ctx, "job:"+jobID).Result()
+		if err == redis.Nil {
+			c.JSON(404, gin.H{"error": "Job not found"})
+			return
+		} else if err != nil {
+			c.JSON(500, gin.H{"error": err.Error()})
+			return
+		}
+
+		var job Job
+		json.Unmarshal([]byte(val), &job)
+		c.JSON(200, job)
+	})
+
+	fmt.Println("🚀 Async Server running on http://localhost:8080")
 	r.Run(":8080")
 }
 
-// executePythonCode spins up a Docker container to run the user's code
+// --- 5. The Worker Logic ---
+func startWorker() {
+	fmt.Println("👷 Worker started. Waiting for jobs...")
+	for {
+		// Wait for a job (Blocking Pop)
+		result, err := rdb.BLPop(ctx, 0*time.Second, "job_queue").Result()
+		if err != nil {
+			continue
+		}
+
+		jobID := result[1]
+		fmt.Printf("⚡ Processing Job: %s\n", jobID)
+
+		// Fetch Job
+		val, _ := rdb.Get(ctx, "job:"+jobID).Result()
+		var job Job
+		json.Unmarshal([]byte(val), &job)
+
+		// Update Status -> Processing
+		job.Status = "processing"
+		updateJob(job)
+
+		// RUN THE CODE (Docker)
+		output, err := executePythonCode(job.Code)
+
+		// Update Status -> Completed/Failed
+		if err != nil {
+			job.Status = "failed"
+			job.Output = err.Error()
+		} else {
+			job.Status = "completed"
+			job.Output = output
+		}
+		updateJob(job)
+		fmt.Printf("✅ Job %s Finished\n", jobID)
+	}
+}
+
+func updateJob(job Job) {
+	data, _ := json.Marshal(job)
+	rdb.Set(ctx, "job:"+job.ID, data, 1*time.Hour)
+}
+
+// --- 6. The Docker Engine (Reused & Fixed) ---
 func executePythonCode(pythonCode string) (string, error) {
 	ctx := context.Background()
 
@@ -62,15 +148,14 @@ func executePythonCode(pythonCode string) (string, error) {
 	if err := os.MkdirAll(tempDir, 0755); err != nil {
 		return "", fmt.Errorf("failed to create temp dir: %v", err)
 	}
-
-	fileName := fmt.Sprintf("job_%d.py", time.Now().UnixNano()) // Unique filename
+	fileName := fmt.Sprintf("job_%d.py", time.Now().UnixNano())
 	filePath := filepath.Join(tempDir, fileName)
 	if err := os.WriteFile(filePath, []byte(pythonCode), 0644); err != nil {
 		return "", fmt.Errorf("failed to write code file: %v", err)
 	}
-	defer os.Remove(filePath) // Cleanup file after run
+	defer os.Remove(filePath)
 
-	// B. Connect to Docker
+	// B. Connect to Docker (WITH VERSION FIX)
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithVersion("1.45"))
 	if err != nil {
 		return "", fmt.Errorf("docker client error: %v", err)
@@ -79,7 +164,7 @@ func executePythonCode(pythonCode string) (string, error) {
 	// C. Create Container
 	resp, err := cli.ContainerCreate(ctx, &container.Config{
 		Image:           "python:alpine",
-		Cmd:             []string{"python", "/app/" + fileName}, // Run the specific file
+		Cmd:             []string{"python", "/app/" + fileName},
 		NetworkDisabled: true,
 	}, &container.HostConfig{
 		Mounts: []mount.Mount{
@@ -91,35 +176,33 @@ func executePythonCode(pythonCode string) (string, error) {
 			},
 		},
 		Resources: container.Resources{
-			Memory: 128 * 1024 * 1024, // 128MB Limit
+			Memory: 128 * 1024 * 1024,
 		},
 	}, nil, nil, "")
 	if err != nil {
 		return "", fmt.Errorf("container create error: %v", err)
 	}
 
-	// D. Start Container
+	// D. Start
 	if err := cli.ContainerStart(ctx, resp.ID, types.ContainerStartOptions{}); err != nil {
 		return "", fmt.Errorf("container start error: %v", err)
 	}
 
-	// E. Wait for Finish (with Timeout)
+	// E. Wait
 	statusCh, errCh := cli.ContainerWait(ctx, resp.ID, container.WaitConditionNotRunning)
 	var outputString string
-
 	select {
 	case err := <-errCh:
 		if err != nil {
 			return "", err
 		}
 	case <-statusCh:
-		// Success
-	case <-time.After(2 * time.Second): // 2s Timeout
+	case <-time.After(5 * time.Second): // 5s Timeout for async
 		cli.ContainerKill(ctx, resp.ID, "SIGKILL")
 		outputString = "⚠️ Error: Time Limit Exceeded"
 	}
 
-	// F. Read Logs
+	// F. Logs
 	out, _ := cli.ContainerLogs(ctx, resp.ID, types.ContainerLogsOptions{ShowStdout: true, ShowStderr: true})
 	stdOutBuf := new(bytes.Buffer)
 	stdErrBuf := new(bytes.Buffer)
@@ -129,13 +212,12 @@ func executePythonCode(pythonCode string) (string, error) {
 	if stdErrBuf.Len() > 0 {
 		finalOutput += "\n[Error Output]:\n" + stdErrBuf.String()
 	}
-
-	if outputString != "" { // Append timeout message if exists
+	if outputString != "" {
 		finalOutput += "\n" + outputString
 	}
-
-	// G. Cleanup Container
-	cli.ContainerRemove(ctx, resp.ID, types.ContainerRemoveOptions{})
+    
+    // G. Clean up the container immediately to save resources
+    cli.ContainerRemove(ctx, resp.ID, types.ContainerRemoveOptions{})
 
 	return finalOutput, nil
 }
