@@ -1,0 +1,29 @@
+version: '3.8'
+
+services:
+  # 1. Redis (Queue)
+  redis:
+    image: redis:alpine
+    container_name: orbit-redis
+    ports:
+      - "6379:6379"
+
+  # 2. Prometheus (Collector)
+  prometheus:
+    image: prom/prometheus
+    container_name: orbit-prometheus
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
+    extra_hosts:
+      - "host.docker.internal:host-gateway" # Allows access to localhost
+
+  # 3. Grafana (Dashboard)
+  grafana:
+    image: grafana/grafana
+    container_name: orbit-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
