@@ -1,5 +1,4 @@
 package main
-
 import (
 	"bytes"
 	"context"
@@ -23,19 +22,19 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// --- 1. Data Structures ---
+
 type Job struct {
 	ID             string `json:"id"`
 	Code           string `json:"code"`
 	ExpectedOutput string `json:"expected_output"`
 	ActualOutput   string `json:"actual_output"`
-	Verdict        string `json:"verdict"`     // Passed, Failed, Error
-	AiDiagnosis    string `json:"ai_diagnosis"` // <--- New Field for AI Feedback
+	Verdict        string `json:"verdict"`     
+	AiDiagnosis    string `json:"ai_diagnosis"` 
 	Status         string `json:"status"`
 	CreatedAt      int64  `json:"created_at"`
 }
 
-// Prometheus Metrics
+
 var jobsProcessed = prometheus.NewCounter(
 	prometheus.CounterOpts{
 		Name: "orbit_jobs_processed_total",
@@ -58,7 +57,6 @@ var ctx = context.Background()
 var rdb *redis.Client
 
 func main() {
-	// --- 2. Connect to Redis ---
 	fmt.Println("🔌 Connecting to Redis...")
 	rdb = redis.NewClient(&redis.Options{
 		Addr: "localhost:6379",
@@ -69,14 +67,12 @@ func main() {
 	}
 	fmt.Println("✅ Connected to Redis")
 
-	// --- 3. Start Workers ---
 	concurrency := 5
 	fmt.Printf("👷 Starting %d Workers...\n", concurrency)
 	for i := 1; i <= concurrency; i++ {
 		go startWorker(i)
 	}
 
-	// --- 4. Start API ---
 	r := gin.Default()
 	r.GET("/metrics", gin.WrapH(promhttp.Handler()))
 
@@ -122,7 +118,6 @@ func main() {
 	r.Run(":8080")
 }
 
-// --- 5. Worker Logic ---
 func startWorker(workerID int) {
 	fmt.Printf("👷 Worker %d ready.\n", workerID)
 	for {
@@ -142,26 +137,24 @@ func startWorker(workerID int) {
 		output, err := executePythonCode(job.Code)
 		job.ActualOutput = output
 
-		// LOGIC UPDATE: Check for Python Errors (Stderr)
 		isRuntimeError := false
 		if err != nil {
-			isRuntimeError = true // Docker failure
+			isRuntimeError = true 
 			job.ActualOutput = err.Error()
 		} else if strings.Contains(output, "Traceback (most recent call last)") || strings.Contains(output, "Error:") {
-			isRuntimeError = true // Python code crash
+			isRuntimeError = true 
 		}
 
 		if isRuntimeError {
 			job.Status = "failed"
 			job.Verdict = "Runtime Error"
 			
-			// 🚀 CALL AI DIAGNOSIS
 			fmt.Printf("🤖 [Worker %d] Runtime Error detected. Calling Nexus...\n", workerID)
 			job.AiDiagnosis = callNexusAI(job.Code, job.ActualOutput)
 			aiCalls.Inc()
 		} else {
 			job.Status = "completed"
-			// Logic check
+			
 			if strings.TrimSpace(job.ActualOutput) == strings.TrimSpace(job.ExpectedOutput) {
 				job.Verdict = "Passed"
 			} else {
@@ -179,22 +172,18 @@ func updateJob(job Job) {
 	rdb.Set(ctx, "job:"+job.ID, data, 1*time.Hour)
 }
 
-// --- 6. Nexus AI Integration ---
 func callNexusAI(code, errorMsg string) string {
-	// Prepare JSON payload
 	requestBody, _ := json.Marshal(map[string]string{
 		"code":  code,
 		"error": errorMsg,
 	})
 
-	// Call Python Service (Assuming running on localhost:5000)
 	resp, err := http.Post("http://0.0.0.0:5001/analyze", "application/json", bytes.NewBuffer(requestBody))
 	if err != nil {
 		return "⚠️ Nexus AI Unavailable: " + err.Error()
 	}
 	defer resp.Body.Close()
 
-	// Read Response
 	body, _ := io.ReadAll(resp.Body)
 	var result map[string]string
 	json.Unmarshal(body, &result)
@@ -202,7 +191,6 @@ func callNexusAI(code, errorMsg string) string {
 	return result["analysis"]
 }
 
-// --- 7. Docker Engine ---
 func executePythonCode(pythonCode string) (string, error) {
 	ctx := context.Background()
 	cwd, _ := os.Getwd()
@@ -219,10 +207,9 @@ func executePythonCode(pythonCode string) (string, error) {
 		return "", fmt.Errorf("client error: %v", err)
 	}
 
-	// Create Container
 	resp, err := cli.ContainerCreate(ctx, &container.Config{
 		Image:           "python:alpine",
-		Cmd:             []string{"python", "-u", "/app/" + fileName}, // Added "-u" for unbuffered output
+		Cmd:             []string{"python", "-u", "/app/" + fileName}, 
 		NetworkDisabled: true,
 	}, &container.HostConfig{
 		Mounts: []mount.Mount{
@@ -238,7 +225,6 @@ func executePythonCode(pythonCode string) (string, error) {
 		return "", fmt.Errorf("start error: %v", err)
 	}
 
-	// Wait for container to finish
 	statusCh, errCh := cli.ContainerWait(ctx, resp.ID, container.WaitConditionNotRunning)
 	var timeoutWarning string
 	select {
@@ -249,22 +235,18 @@ func executePythonCode(pythonCode string) (string, error) {
 		timeoutWarning = "\n⚠️ Time Limit Exceeded"
 	}
 
-	// Fetch Logs (Both Stdout and Stderr)
 	out, _ := cli.ContainerLogs(ctx, resp.ID, types.ContainerLogsOptions{ShowStdout: true, ShowStderr: true})
 	stdOutBuf := new(bytes.Buffer)
-	stdErrBuf := new(bytes.Buffer) // Create a real buffer for Stderr
+	stdErrBuf := new(bytes.Buffer) 
 	
-	// Copy logs to respective buffers
 	stdcopy.StdCopy(stdOutBuf, stdErrBuf, out)
 
-	// Combine Output: Stdout + Stderr + Warnings
 	finalOutput := stdOutBuf.String()
 	if stdErrBuf.Len() > 0 {
-		finalOutput += "\n" + stdErrBuf.String() // Append error log
+		finalOutput += "\n" + stdErrBuf.String() 
 	}
 	finalOutput += timeoutWarning
 	
-	// Clean up
 	cli.ContainerRemove(ctx, resp.ID, types.ContainerRemoveOptions{})
 
 	return finalOutput, nil

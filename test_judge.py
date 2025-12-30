@@ -13,7 +13,6 @@ def submit_test(code, expected):
     })
     job_id = res.json()['job_id']
     
-    # Poll for result
     while True:
         status_res = requests.get(f"{URL}/status/{job_id}").json()
         if status_res['status'] in ['completed', 'failed']:
@@ -22,11 +21,6 @@ def submit_test(code, expected):
             break
         time.sleep(0.5)
 
-# Test 1: Should PASS
 submit_test('print("Hello World")', 'Hello World')
-
-# Test 2: Should FAIL
 submit_test('print("Wrong Answer")', 'Hello World')
-
-# Test 3: Should FAIL (Math error)
 submit_test('print(5 + 5)', '11')

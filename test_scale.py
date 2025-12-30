@@ -3,7 +3,6 @@ import threading
 import time
 
 def submit_job(i):
-    # Send a job that sleeps for 2 seconds (to simulate work)
     payload = {"code": "import time; time.sleep(2); print(f'Job {i} done')"}
     try:
         res = requests.post("http://localhost:8080/submit", json=payload)

@@ -1,8 +1,7 @@
 global:
-  scrape_interval: 2s # Fast scraping for real-time feel
+  scrape_interval: 2s 
 
 scrape_configs:
   - job_name: 'orbit-engine'
     static_configs:
-      # host.docker.internal refers to your Windows machine from inside Docker
       - targets: ['host.docker.internal:8080']
